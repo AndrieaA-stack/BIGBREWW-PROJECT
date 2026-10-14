@@ -1,6 +1,16 @@
+import os
+import subprocess
+import tempfile
 from datetime import datetime
 import customtkinter as ctk
-from db_helper import save_sales_record, get_all_menu_items
+from PIL import Image
+from db_helper import insert_order
+
+SIZE_MODIFIERS = {
+    "Large (22oz) [₱0.00]": 0.0,
+    "Medium (16oz) [-₱5.00]": -5.0,
+    "Jumbo (1L) [+₱20.00]": 20.0,
+}
 
 ADD_ONS = {
     "Extra Pearl": 10.0,
@@ -9,11 +19,6 @@ ADD_ONS = {
     "Crushed Oreos": 10.0,
 }
 
-SIZE_MODIFIERS = {
-    "Medium (16oz) [-₱5.00]": -5.0,
-    "Large (22oz) [₱0.00]": 0.0,
-    "Jumbo (1L) [+₱20.00]": 20.0,
-}
 
 class CustomerPortal(ctk.CTkFrame):
     def __init__(self, parent, app):
@@ -23,7 +28,7 @@ class CustomerPortal(ctk.CTkFrame):
         self.selected_item_name = None
         self.selected_item_category = None
         self.selected_item_price = 0.0
-        self.menu_data = {}
+        self.item_images_cache = {}
 
         self.grid_columnconfigure(0, weight=3)
         self.grid_columnconfigure(1, weight=2)
@@ -32,35 +37,13 @@ class CustomerPortal(ctk.CTkFrame):
         self._build_left_panel()
         self._build_right_panel()
 
-    def load_menu_from_db(self):
-        """ Fetch fresh items from MySQL and rebuild categories """
-        raw_items = get_all_menu_items()
-        self.menu_data = {}
-
-        #DEFAULT CATEGORY PAG WALA LAMAN YUNG DB
-        if not raw_items:
-            self.menu_data = {"Milk Tea": {}, "Iced Coffee": {}, "Fruit Tea": {}}
-        else:
-            for item_id, name, price, category in raw_items:
-                if category not in self.menu_data:
-                    self.menu_data[category] = {}
-                self.menu_data[category][name] = float(price)
-
-        # Clear and recreate tabs dynamically
-        for tab_name in list(self.tabview._tab_dict.keys()):
-            self.tabview.delete(tab_name)
-
-        for category in self.menu_data.keys():
-            self.tabview.add(category)
-
-        if self.menu_data:
-            first_cat = list(self.menu_data.keys())[0]
-            self.tabview.set(first_cat)
-            self._populate_menu(first_cat)
-
-    def RefreshMenu(self):
-        #PABALIK SA CUSTOMER PORTAL
-        self.load_menu_from_db()
+    def _get_dynamic_categories(self):
+        cats = ["Milk Tea", "Iced Coffee", "Fruit Tea"]
+        for item in self.app.shared_menu_items:
+            cat = item.get("category")
+            if cat and cat not in cats:
+                cats.append(cat)
+        return cats
 
     def _build_left_panel(self):
         left_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -68,26 +51,33 @@ class CustomerPortal(ctk.CTkFrame):
         left_frame.grid_rowconfigure(2, weight=1)
         left_frame.grid_columnconfigure(0, weight=1)
 
+        #Header bar
         header_box = ctk.CTkFrame(left_frame, fg_color="transparent")
         header_box.grid(row=0, column=0, padx=15, pady=(15, 5), sticky="ew")
 
         ctk.CTkLabel(header_box, image=self.app.logo_ctk_image, text="").pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(header_box, text="BIGBREW POS", font=ctk.CTkFont(size=24, weight="bold"),
-                      text_color="#FFA500").pack(side="left")
+        ctk.CTkLabel(header_box, text="BIGBREW POS", font=ctk.CTkFont(size=24, weight="bold"), text_color="#FFA500").pack(side="left")
 
         ctk.CTkButton(header_box, text="Switch User", width=80, fg_color="#333", command=self.app.show_auth_selection).pack(side="right")
 
+        #Category Tabs
         self.tabview = ctk.CTkTabview(left_frame, command=self._on_tab_change)
         self.tabview.grid(row=1, column=0, padx=15, pady=5, sticky="ew")
 
+        for category in self._get_dynamic_categories():
+            self.tabview.add(category)
+
+        #Scrollable Menu Items Container
         self.menu_scroll = ctk.CTkScrollableFrame(left_frame, label_text="Menu Items")
         self.menu_scroll.grid(row=2, column=0, padx=15, pady=5, sticky="nsew")
         self.menu_scroll.grid_columnconfigure((0, 1, 2), weight=1)
 
+        #Customization Box
         custom_frame = ctk.CTkFrame(left_frame, fg_color="#1e1e1e", corner_radius=8)
         custom_frame.grid(row=3, column=0, padx=15, pady=15, sticky="ew")
         custom_frame.grid_columnconfigure((0, 1), weight=1)
 
+        #Size Dropdown
         ctk.CTkLabel(custom_frame, text="Size Pricing:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, padx=10, pady=(5, 0), sticky="w")
         self.size_var = ctk.StringVar(value="Large (22oz) [₱0.00]")
         self.size_dropdown = ctk.CTkOptionMenu(
@@ -98,6 +88,7 @@ class CustomerPortal(ctk.CTkFrame):
         )
         self.size_dropdown.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="ew")
 
+        #Add ons CheckboxeS
         ctk.CTkLabel(custom_frame, text="Add-ons (+₱10.00 each):", font=ctk.CTkFont(weight="bold")).grid(row=0, column=1, padx=10, pady=(5, 0), sticky="w")
         self.addon_vars = {}
         addon_subframe = ctk.CTkFrame(custom_frame, fg_color="transparent")
@@ -109,6 +100,7 @@ class CustomerPortal(ctk.CTkFrame):
             chk = ctk.CTkCheckBox(addon_subframe, text=f"{addon} (+₱{price:.0f})", variable=var, font=ctk.CTkFont(size=11))
             chk.grid(row=idx // 2, column=idx % 2, padx=5, pady=2, sticky="w")
 
+        # Add to cart button
         self.add_btn = ctk.CTkButton(
             custom_frame,
             text="Select an Item First",
@@ -121,7 +113,7 @@ class CustomerPortal(ctk.CTkFrame):
         )
         self.add_btn.grid(row=2, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
 
-        self.load_menu_from_db()
+        self.RefreshMenu()
 
     def _build_right_panel(self):
         right_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -129,7 +121,11 @@ class CustomerPortal(ctk.CTkFrame):
         right_frame.grid_rowconfigure(1, weight=1)
         right_frame.grid_columnconfigure(0, weight=1)
 
-        self.cart_title = ctk.CTkLabel(right_frame, text=f"Order Cart ({self.app.customer_name})", font=ctk.CTkFont(size=18, weight="bold"))
+        self.cart_title = ctk.CTkLabel(
+            right_frame,
+            text=f"Order Cart ({self.app.customer_name})",
+            font=ctk.CTkFont(size=18, weight="bold")
+        )
         self.cart_title.grid(row=0, column=0, padx=15, pady=(15, 5), sticky="w")
 
         self.cart_scroll = ctk.CTkScrollableFrame(right_frame, label_text="Items")
@@ -139,7 +135,12 @@ class CustomerPortal(ctk.CTkFrame):
         summary_frame = ctk.CTkFrame(right_frame, fg_color="#1e1e1e", corner_radius=8)
         summary_frame.grid(row=2, column=0, padx=15, pady=15, sticky="ew")
 
-        self.total_label = ctk.CTkLabel(summary_frame, text="Total: ₱0.00", font=ctk.CTkFont(size=22, weight="bold"), text_color="#2ECC71")
+        self.total_label = ctk.CTkLabel(
+            summary_frame,
+            text="Total: ₱0.00",
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#2ECC71"
+        )
         self.total_label.pack(anchor="w", padx=15, pady=(10, 5))
 
         payment_box = ctk.CTkFrame(summary_frame, fg_color="transparent")
@@ -156,30 +157,62 @@ class CustomerPortal(ctk.CTkFrame):
         btn_box = ctk.CTkFrame(summary_frame, fg_color="transparent")
         btn_box.pack(fill="x", padx=15, pady=10)
 
-        ctk.CTkButton(btn_box, text="Clear", fg_color="#E74C3C", hover_color="#C0392B", width=80, command=self._clear_cart).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(btn_box, text="Checkout & Pay", fg_color="#2ECC71", hover_color="#27AE60", font=ctk.CTkFont(weight="bold"), command=self._checkout).pack(side="right", fill="x", expand=True)
+        ctk.CTkButton(
+            btn_box,
+            text="Clear",
+            fg_color="#E74C3C",
+            hover_color="#C0392B",
+            width=80,
+            command=self._clear_cart
+        ).pack(side="left", padx=(0, 5))
 
-    def update_cart_title(self):
-        self.cart_title.configure(text=f"Order Cart ({self.app.customer_name})")
+        ctk.CTkButton(
+            btn_box,
+            text="Checkout & Pay",
+            fg_color="#2ECC71",
+            hover_color="#27AE60",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._checkout
+        ).pack(side="right", fill="x", expand=True)
 
     def _on_tab_change(self):
         category = self.tabview.get()
-        if category:
-            self._populate_menu(category)
+        self._populate_menu(category)
+
+    def RefreshMenu(self):
+        category = self.tabview.get() if hasattr(self, 'tabview') and self.tabview.get() else "Milk Tea"
+        self._populate_menu(category)
+
+    def _get_item_ctk_image(self, item):
+        img_path = item.get("image")
+        if img_path and os.path.exists(img_path):
+            if img_path not in self.item_images_cache:
+                try:
+                    pil_img = Image.open(img_path)
+                    self.item_images_cache[img_path] = ctk.CTkImage(
+                        light_image=pil_img, dark_image=pil_img, size=(45, 45)
+                    )
+                except Exception:
+                    return self.app.item_ctk_image
+            return self.item_images_cache[img_path]
+        return self.app.item_ctk_image
 
     def _populate_menu(self, category):
         for widget in self.menu_scroll.winfo_children():
             widget.destroy()
 
-        items = self.menu_data.get(category, {})
-        item_img = self.app.ctk_item_images.get(category, self.app.ctk_item_images.get("Milk Tea"))
+        category_items = [it for it in self.app.shared_menu_items if it.get("category") == category]
 
         row, col = 0, 0
-        for item_name, base_price in items.items():
+        for item in category_items:
+            item_name = item["name"]
+            base_price = float(item["price"])
+            img = self._get_item_ctk_image(item)
+
             btn = ctk.CTkButton(
                 self.menu_scroll,
                 text=f"{item_name}\n₱{base_price:.2f}",
-                image=item_img,
+                image=img,
                 compound="top",
                 height=90,
                 fg_color="#2d2d2d",
@@ -202,12 +235,10 @@ class CustomerPortal(ctk.CTkFrame):
     def _update_add_button_label(self, choice=None):
         if not self.selected_item_name:
             return
-
         base_price = self.selected_item_price
         selected_size_key = self.size_var.get()
         size_adj = SIZE_MODIFIERS[selected_size_key]
         item_price = base_price + size_adj
-
         self.add_btn.configure(text=f"Add '{self.selected_item_name}' to Order (₱{item_price:.2f})")
 
     def _add_to_cart(self):
@@ -325,69 +356,115 @@ class CustomerPortal(ctk.CTkFrame):
             return
 
         change = cash - total
-        order_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        order_snapshot = list(self.current_order)
 
-        success = save_sales_record(
+        order_id = insert_order(
             customer_name=self.app.customer_name,
-            timestamp=order_date,
-            total=total,
-            cash=cash,
-            change=change,
-            items=self.current_order
+            total_amount=total,
+            cash_tendered=cash,
+            change_due=change,
+            order_items=order_snapshot
         )
 
-        if success:
-            sales_record = {
-                "customer": self.app.customer_name,
-                "timestamp": order_date,
-                "items": self.current_order,
-                "total": total,
-                "cash": cash,
-                "change": change
-            }
-            self._show_receipt_dialog(sales_record)
-            self._clear_cart()
-        else:
-            err_win = ctk.CTkToplevel(self)
-            err_win.title("Database Error")
-            err_win.geometry("300x120")
-            err_win.attributes('-topmost', True)
-            ctk.CTkLabel(err_win, text="Failed to save order to XAMPP database!", font=ctk.CTkFont(weight="bold"), text_color="#E74C3C").pack(pady=20)
-            ctk.CTkButton(err_win, text="OK", command=err_win.destroy).pack()
+        self._show_clean_receipt_modal(order_id or "OFFLINE", total, cash, change, order_snapshot)
+        self._clear_cart()
 
-    def _show_receipt_dialog(self, record):
+    def _show_clean_receipt_modal(self, order_id, total, cash, change, items):
+        """Displays a centered receipt preview with silent, zero-prompt auto-printing."""
         receipt_win = ctk.CTkToplevel(self)
-        receipt_win.title("Receipt")
-        receipt_win.geometry("350x520")
+        receipt_win.title("Transaction Receipt")
+        receipt_win.resizable(False, False)
         receipt_win.attributes('-topmost', True)
 
-        txt = ctk.CTkTextbox(receipt_win, font=ctk.CTkFont(family="Courier", size=12))
-        txt.pack(fill="both", expand=True, padx=10, pady=10)
+        #RECEIPT
+        win_w, win_h = 380, 600
+        screen_w = receipt_win.winfo_screenwidth()
+        screen_h = receipt_win.winfo_screenheight()
+        pos_x = (screen_w - win_w) // 2
+        pos_y = (screen_h - win_h) // 2
+        receipt_win.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
 
-        lines = [
-            "      BIGBREW PHILIPPINES      ",
-            "     Official Order Receipt    ",
-            "=" * 31,
-            f"Customer: {record['customer']}",
-            f"Date:     {record['timestamp']}",
-            "-" * 31
+        now_str = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+        receipt_num = f"INV-{order_id:05d}" if isinstance(order_id, int) else str(order_id)
+
+        receipt_lines = [
+            "========================================",
+            "             BIGBREW POS               ",
+            "         Order & Billing Receipt        ",
+            "========================================",
+            f"Date / Time : {now_str}",
+            f"Receipt No. : {receipt_num}",
+            f"Customer    : {self.app.customer_name}",
+            f"Cashier     : Admin / Cashier",
+            "----------------------------------------",
+            f"{'ITEM / DESC':<26}{'PRICE':>14}",
+            "----------------------------------------",
         ]
 
-        for item in record['items']:
-            lines.append(f"{item['name']}")
-            lines.append(f"  {item['size']:<18} ₱{item['price']:>6.2f}")
-            if item['addons']:
-                lines.append(f"  + {', '.join(item['addons'])}")
+        for itm in items:
+            line_title = f"{itm['name']} ({itm['size']})"
+            receipt_lines.append(f"{line_title:<26} PHP {itm['price']:>7.2f}")
+            if itm.get("addons"):
+                for ad in itm["addons"]:
+                    receipt_lines.append(f"  + {ad:<22} PHP   10.00")
 
-        lines.extend([
-            "-" * 31,
-            f"TOTAL:               ₱{record['total']:>8.2f}",
-            f"CASH TENDERED:       ₱{record['cash']:>8.2f}",
-            f"CHANGE:              ₱{record['change']:>8.2f}",
-            "=" * 31,
-            "   Thank you for enjoying BigBrew!  "
+        receipt_lines.extend([
+            "----------------------------------------",
+            f"{'TOTAL AMOUNT:':<26} PHP {total:>7.2f}",
+            f"{'CASH TENDERED:':<26} PHP {cash:>7.2f}",
+            f"{'CHANGE:':<26} PHP {change:>7.2f}",
+            "========================================",
+            "       Thank you for your order!        ",
+            "========================================",
         ])
 
-        txt.insert("1.0", "\n".join(lines))
-        txt.configure(state="disabled")
-        ctk.CTkButton(receipt_win, text="Close", command=receipt_win.destroy).pack(pady=(0, 10))
+        full_receipt_text = "\n".join(receipt_lines)
+
+        container = ctk.CTkFrame(receipt_win, corner_radius=10)
+        container.pack(fill="both", expand=True, padx=12, pady=12)
+
+        text_box = ctk.CTkTextbox(
+            container,
+            font=("Consolas", 12),
+            wrap="none",
+            activate_scrollbars=True
+        )
+        text_box.pack(fill="both", expand=True, padx=8, pady=(8, 12))
+        text_box.insert("1.0", full_receipt_text)
+        text_box.configure(state="disabled")
+
+        def handle_print_direct():
+            temp_dir = tempfile.gettempdir()
+            file_path = os.path.join(temp_dir, f"receipt_{receipt_num}.txt")
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(full_receipt_text)
+
+            ps_cmd = f'Get-Content -Path "{file_path}" -Raw | Out-Printer'
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+
+        btn_row = ctk.CTkFrame(container, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=(0, 6))
+
+        print_btn = ctk.CTkButton(
+            btn_row,
+            text="🖨️ Print Receipt",
+            fg_color="#2ECC71",
+            hover_color="#27AE60",
+            text_color="black",
+            font=ctk.CTkFont(weight="bold"),
+            command=handle_print_direct
+        )
+        print_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        close_btn = ctk.CTkButton(
+            btn_row,
+            text="Done",
+            fg_color="#333333",
+            hover_color="#444444",
+            command=receipt_win.destroy
+        )
+        close_btn.pack(side="right", fill="x", expand=True, padx=(4, 0))
